@@ -62,7 +62,7 @@ concurrency:
 env:
   # The one variable that separates the arms: on baseline, action-checkout
   # skips its Set up Chalk step entirely.
-  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+  CHALK_ON: ${{ inputs.leg == 'instrumented' }}
 
 run-name: "Arduino as ESP-IDF Component ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
 
@@ -70,7 +70,7 @@ jobs:
   cmake-check:
     name: Check CMakeLists
     runs-on: ubuntu-latest
-    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/')) }}
+    if: ${{ !('push' == 'pull_request' && startsWith(github.head_ref, 'release/')) }}
     steps:
       - name: Checkout code
         uses: crashappsec/action-checkout@main
@@ -90,7 +90,7 @@ jobs:
   check-examples:
     name: Check Examples Match
     runs-on: ubuntu-latest
-    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/')) }}
+    if: ${{ !('push' == 'pull_request' && startsWith(github.head_ref, 'release/')) }}
     steps:
       - name: Checkout code
         uses: crashappsec/action-checkout@main
@@ -137,7 +137,7 @@ jobs:
   set-matrix:
     name: Set Matrix
     runs-on: ubuntu-latest
-    if: ${{ !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/')) }}
+    if: ${{ !('push' == 'pull_request' && startsWith(github.head_ref, 'release/')) }}
     outputs:
       should_run: ${{ steps.check-variants.outputs.should_run }}
       matrix: ${{ steps.set-matrix.outputs.matrix }}
@@ -172,7 +172,7 @@ jobs:
         id: check-variants
         run: |
           bash .github/scripts/check_official_variants.sh \
-            "${{ github.event_name }}" \
+            "${{ 'push' }}" \
             "IDF_COMPONENT_TARGETS" \
             ${{ steps.changed-files.outputs.all_changed_files }}
 
@@ -180,7 +180,7 @@ jobs:
         id: affected-examples
         if: steps.check-variants.outputs.should_run == 'true'
         env:
-          IS_PR: ${{ github.event_name == 'pull_request' }}
+          IS_PR: ${{ 'push' == 'pull_request' }}
         run: |
           (which ctags-universal || which ctags) || (echo "Error: Neither ctags-universal nor ctags found in PATH" && exit 1)
           python3 ./.github/scripts/get_affected.py --debug --component ${{ steps.changed-files.outputs.all_changed_files }} > affected_examples.txt
@@ -269,7 +269,7 @@ jobs:
     name: Build IDF ${{ matrix.idf_ver }} for ${{ matrix.idf_target }}
     runs-on: ubuntu-latest
     needs: set-matrix
-    if: ${{ (github.event_name == 'workflow_dispatch' || needs.set-matrix.outputs.should_run == 'true') && (github.event_name == 'workflow_dispatch' || needs.set-matrix.outputs.should_build == '1') }}
+    if: ${{ ('push' == 'workflow_dispatch' || needs.set-matrix.outputs.should_run == 'true') && ('push' == 'workflow_dispatch' || needs.set-matrix.outputs.should_build == '1') }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.set-matrix.outputs.matrix) }}
