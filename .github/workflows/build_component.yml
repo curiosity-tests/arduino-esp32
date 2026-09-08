@@ -73,7 +73,7 @@ jobs:
     if: ${{ !('push' == 'pull_request' && startsWith(github.head_ref, 'release/')) }}
     steps:
       - name: Checkout code
-        uses: crashappsec/action-checkout@main
+        uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
         with:
           chalk: ${{ env.CHALK_ON }}
           profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
@@ -93,7 +93,7 @@ jobs:
     if: ${{ !('push' == 'pull_request' && startsWith(github.head_ref, 'release/')) }}
     steps:
       - name: Checkout code
-        uses: crashappsec/action-checkout@main
+        uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
         with:
           chalk: ${{ env.CHALK_ON }}
           profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
@@ -151,7 +151,7 @@ jobs:
           execute_install_scripts: true
 
       - name: Checkout repository
-        uses: crashappsec/action-checkout@main
+        uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
         with:
           chalk: ${{ env.CHALK_ON }}
           profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
@@ -299,7 +299,7 @@ jobs:
           exit 0
 
       - name: Check out arduino-esp32 as a component
-        uses: crashappsec/action-checkout@main
+        uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
         with:
           chalk: ${{ env.CHALK_ON }}
           profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
