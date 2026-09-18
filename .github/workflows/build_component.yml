@@ -28,28 +28,28 @@ on:
         required: false
   push:
     branches:
-      - master
-      - release/*
+    - master
+    - release/*
   pull_request:
     paths:
-      - "cores/**"
-      - "libraries/**/*.cpp"
-      - "libraries/**/*.c"
-      - "libraries/**/*.h"
-      - "idf_component_examples/**"
-      - "idf_component.yml"
-      - "Kconfig.projbuild"
-      - ".github/workflows/build_component.yml"
-      - ".github/scripts/check-cmakelists.sh"
-      - ".github/scripts/on-push-idf.sh"
-      - ".github/scripts/sketch_utils.sh"
-      - ".github/scripts/get_affected.py"
-      - ".github/scripts/socs_config.sh"
-      - "variants/**"
-      - "!*.md"
-      - "!*.txt"
-      - "!*.properties"
-      - "CMakeLists.txt"
+    - "cores/**"
+    - "libraries/**/*.cpp"
+    - "libraries/**/*.c"
+    - "libraries/**/*.h"
+    - "idf_component_examples/**"
+    - "idf_component.yml"
+    - "Kconfig.projbuild"
+    - ".github/workflows/build_component.yml"
+    - ".github/scripts/check-cmakelists.sh"
+    - ".github/scripts/on-push-idf.sh"
+    - ".github/scripts/sketch_utils.sh"
+    - ".github/scripts/get_affected.py"
+    - ".github/scripts/socs_config.sh"
+    - "variants/**"
+    - "!*.md"
+    - "!*.txt"
+    - "!*.properties"
+    - "CMakeLists.txt"
 
 permissions:
   contents: read
@@ -72,68 +72,210 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !('push' == 'pull_request' && startsWith(github.head_ref, 'release/')) }}
     steps:
-      - name: Checkout code
-        uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Checkout code
+      uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+    - run: bash ./.github/scripts/check-cmakelists.sh
 
-      - run: bash ./.github/scripts/check-cmakelists.sh
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   check-examples:
     name: Check Examples Match
     runs-on: ubuntu-latest
     if: ${{ !('push' == 'pull_request' && startsWith(github.head_ref, 'release/')) }}
     steps:
-      - name: Checkout code
-        uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Checkout code
+      uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+    - name: Check examples consistency
+      run: |
+        # Get list of folders in idf_component_examples (excluding hidden files)
+        actual_examples=$(find idf_component_examples -maxdepth 1 -type d ! -path idf_component_examples | sed 's|idf_component_examples/||' | sort)
 
-      - name: Check examples consistency
-        run: |
-          # Get list of folders in idf_component_examples (excluding hidden files)
-          actual_examples=$(find idf_component_examples -maxdepth 1 -type d ! -path idf_component_examples | sed 's|idf_component_examples/||' | sort)
+        # Extract example paths from idf_component.yml
+        declared_examples=$(grep -A 100 "^examples:" idf_component.yml | grep "path:" | sed 's/.*path: *\.\/idf_component_examples\///' | sort)
 
-          # Extract example paths from idf_component.yml
-          declared_examples=$(grep -A 100 "^examples:" idf_component.yml | grep "path:" | sed 's/.*path: *\.\/idf_component_examples\///' | sort)
+        echo "=== Examples in idf_component_examples folder ==="
+        echo "$actual_examples"
+        echo ""
+        echo "=== Examples declared in idf_component.yml ==="
+        echo "$declared_examples"
+        echo ""
 
-          echo "=== Examples in idf_component_examples folder ==="
-          echo "$actual_examples"
+        # Compare the two lists
+        if [ "$actual_examples" != "$declared_examples" ]; then
+          echo "❌ ERROR: Examples mismatch detected!"
           echo ""
-          echo "=== Examples declared in idf_component.yml ==="
-          echo "$declared_examples"
+          echo "Examples in folder but NOT in idf_component.yml:"
+          comm -23 <(echo "$actual_examples") <(echo "$declared_examples") | sed 's/^/  - /'
           echo ""
+          echo "Examples in idf_component.yml but NOT in folder:"
+          comm -13 <(echo "$actual_examples") <(echo "$declared_examples") | sed 's/^/  - /'
+          exit 1
+        else
+          echo "✅ All examples match correctly!"
+        fi
 
-          # Compare the two lists
-          if [ "$actual_examples" != "$declared_examples" ]; then
-            echo "❌ ERROR: Examples mismatch detected!"
-            echo ""
-            echo "Examples in folder but NOT in idf_component.yml:"
-            comm -23 <(echo "$actual_examples") <(echo "$declared_examples") | sed 's/^/  - /'
-            echo ""
-            echo "Examples in idf_component.yml but NOT in folder:"
-            comm -13 <(echo "$actual_examples") <(echo "$declared_examples") | sed 's/^/  - /'
-            exit 1
-          else
-            echo "✅ All examples match correctly!"
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
           fi
+        done
 
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   set-matrix:
     name: Set Matrix
     runs-on: ubuntu-latest
@@ -143,128 +285,199 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       should_build: ${{ steps.affected-examples.outputs.should_build }}
     steps:
-      - name: Install universal-ctags
-        uses: awalsh128/cache-apt-pkgs-action@2c09a5e66da6c8016428a2172bd76e5e4f14bb17 # v1.5.3
-        with:
-          packages: libicu74 libjansson4 libxml2 libyaml-0-2 universal-ctags
-          version: 1
-          execute_install_scripts: true
+    - name: Install universal-ctags
+      uses: awalsh128/cache-apt-pkgs-action@2c09a5e66da6c8016428a2172bd76e5e4f14bb17   # v1.5.3
+      with:
+        packages: libicu74 libjansson4 libxml2 libyaml-0-2 universal-ctags
+        version: 1
+        execute_install_scripts: true
 
-      - name: Checkout repository
-        uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-          fetch-depth: 2
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Checkout repository
+      uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+        fetch-depth: 2
+    - name: Get changed files
+      id: changed-files
+      uses: tj-actions/changed-files@2f7c5bfce28377bc069a65ba478de0a74aa0ca32   # v46.0.1
 
-      - name: Get changed files
-        id: changed-files
-        uses: tj-actions/changed-files@2f7c5bfce28377bc069a65ba478de0a74aa0ca32 # v46.0.1
+    - name: Check if official variants changed
+      id: check-variants
+      run: |
+        bash .github/scripts/check_official_variants.sh \
+          "${{ 'push' }}" \
+          "IDF_COMPONENT_TARGETS" \
+          ${{ steps.changed-files.outputs.all_changed_files }}
 
-      - name: Check if official variants changed
-        id: check-variants
-        run: |
-          bash .github/scripts/check_official_variants.sh \
-            "${{ 'push' }}" \
-            "IDF_COMPONENT_TARGETS" \
-            ${{ steps.changed-files.outputs.all_changed_files }}
+    - name: Get affected examples
+      id: affected-examples
+      if: steps.check-variants.outputs.should_run == 'true'
+      env:
+        IS_PR: ${{ 'push' == 'pull_request' }}
+      run: |
+        (which ctags-universal || which ctags) || (echo "Error: Neither ctags-universal nor ctags found in PATH" && exit 1)
+        python3 ./.github/scripts/get_affected.py --debug --component ${{ steps.changed-files.outputs.all_changed_files }} > affected_examples.txt
 
-      - name: Get affected examples
-        id: affected-examples
-        if: steps.check-variants.outputs.should_run == 'true'
-        env:
-          IS_PR: ${{ 'push' == 'pull_request' }}
-        run: |
-          (which ctags-universal || which ctags) || (echo "Error: Neither ctags-universal nor ctags found in PATH" && exit 1)
-          python3 ./.github/scripts/get_affected.py --debug --component ${{ steps.changed-files.outputs.all_changed_files }} > affected_examples.txt
+    - name: Upload affected examples
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+      if: steps.check-variants.outputs.should_run == 'true'
+      with:
+        name: affected_examples
+        path: affected_examples.txt
+        if-no-files-found: error
 
-      - name: Upload affected examples
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: steps.check-variants.outputs.should_run == 'true'
-        with:
-          name: affected_examples
-          path: affected_examples.txt
-          if-no-files-found: error
+    - name: Upload debug artifacts
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+      if: steps.check-variants.outputs.should_run == 'true'
+      with:
+        name: get_affected_debug
+        path: |
+          ctags_defs_by_qname.json
+          ctags_header_to_qnames.json
+          ctags_tags.jsonl
+          dependencies.json
+          dependencies_reverse.json
+        if-no-files-found: warn
 
-      - name: Upload debug artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: steps.check-variants.outputs.should_run == 'true'
-        with:
-          name: get_affected_debug
-          path: |
-            ctags_defs_by_qname.json
-            ctags_header_to_qnames.json
-            ctags_tags.jsonl
-            dependencies.json
-            dependencies_reverse.json
-          if-no-files-found: warn
+    - name: Get Matrix Combinations
+      id: set-matrix
+      if: steps.check-variants.outputs.should_run == 'true'
+      run: |
+        # Source centralized SoC configuration
+        source .github/scripts/socs_config.sh
 
-      - name: Get Matrix Combinations
-        id: set-matrix
-        if: steps.check-variants.outputs.should_run == 'true'
-        run: |
-          # Source centralized SoC configuration
-          source .github/scripts/socs_config.sh
+        # Default versions if not provided via inputs
+        DEFAULT_VERSIONS="release-v5.3,release-v5.4,release-v5.5,release-v6.0,release-v6.1"
 
-          # Default versions if not provided via inputs
-          DEFAULT_VERSIONS="release-v5.3,release-v5.4,release-v5.5,release-v6.0,release-v6.1"
+        # Use inputs if provided, otherwise use defaults
+        if [[ -n "${{ inputs.idf_ver }}" ]]; then
+          VERSIONS="${{ inputs.idf_ver }}"
+        else
+          VERSIONS="$DEFAULT_VERSIONS"
+        fi
 
-          # Use inputs if provided, otherwise use defaults
-          if [[ -n "${{ inputs.idf_ver }}" ]]; then
-            VERSIONS="${{ inputs.idf_ver }}"
+        # Generate matrix combinations
+        echo '{"include": [' > matrix.json
+        first=true
+        IFS=',' read -ra VERSION_ARRAY <<< "$VERSIONS"
+
+        for version in "${VERSION_ARRAY[@]}"; do
+          # Trim whitespace
+          version=$(echo "$version" | xargs)
+
+          # Get targets for this version
+          if [[ -n "${{ inputs.idf_targets }}" ]]; then
+            # Use provided targets for all versions
+            targets="${{ inputs.idf_targets }}"
           else
-            VERSIONS="$DEFAULT_VERSIONS"
+            # Use version-specific targets from centralized config
+            targets=$(get_targets_for_idf_version "$version")
           fi
 
-          # Generate matrix combinations
-          echo '{"include": [' > matrix.json
-          first=true
-          IFS=',' read -ra VERSION_ARRAY <<< "$VERSIONS"
+          if [[ -n "$targets" ]]; then
+            IFS=',' read -ra TARGET_ARRAY <<< "$targets"
+            for target in "${TARGET_ARRAY[@]}"; do
+              # Trim whitespace
+              target=$(echo "$target" | xargs)
 
-          for version in "${VERSION_ARRAY[@]}"; do
-            # Trim whitespace
-            version=$(echo "$version" | xargs)
+              if [ "$first" = true ]; then
+                first=false
+              else
+                echo ',' >> matrix.json
+              fi
+              echo "{\"idf_ver\": \"$version\", \"idf_target\": \"$target\"}" >> matrix.json
+            done
+          fi
+        done
+        echo ']}' >> matrix.json
 
-            # Get targets for this version
-            if [[ -n "${{ inputs.idf_targets }}" ]]; then
-              # Use provided targets for all versions
-              targets="${{ inputs.idf_targets }}"
-            else
-              # Use version-specific targets from centralized config
-              targets=$(get_targets_for_idf_version "$version")
-            fi
+        # Debug: Print the matrix for verification
+        echo "Debug - Generated matrix:"
+        cat matrix.json | jq .
 
-            if [[ -n "$targets" ]]; then
-              IFS=',' read -ra TARGET_ARRAY <<< "$targets"
-              for target in "${TARGET_ARRAY[@]}"; do
-                # Trim whitespace
-                target=$(echo "$target" | xargs)
+        # Set output
+        printf "matrix=%s\n" "$(cat matrix.json | jq -c .)" >> $GITHUB_OUTPUT
 
-                if [ "$first" = true ]; then
-                  first=false
-                else
-                  echo ',' >> matrix.json
-                fi
-                echo "{\"idf_ver\": \"$version\", \"idf_target\": \"$target\"}" >> matrix.json
-              done
-            fi
-          done
-          echo ']}' >> matrix.json
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
-          # Debug: Print the matrix for verification
-          echo "Debug - Generated matrix:"
-          cat matrix.json | jq .
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
 
-          # Set output
-          printf "matrix=%s\n" "$(cat matrix.json | jq -c .)" >> $GITHUB_OUTPUT
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
 
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   build-esp-idf-component:
     name: Build IDF ${{ matrix.idf_ver }} for ${{ matrix.idf_target }}
     runs-on: ubuntu-latest
@@ -275,8 +488,8 @@ jobs:
       matrix: ${{ fromJson(needs.set-matrix.outputs.matrix) }}
     container: espressif/idf:${{ matrix.idf_ver }}
     steps:
-      - name: Install curl/bash for action-checkout (racecar; ungated, both arms)
-        shell: sh
+    - name: Install curl/bash for action-checkout (racecar; ungated, both arms)
+      shell: sh
         # Best-effort probe, never a gate. Inside a container job running as a
         # non-root user, apt-get cannot write /var/lib/apt/lists and exits 100,
         # which failed ardupilot's build job at step 3 before any of its own work
@@ -284,64 +497,135 @@ jobs:
         # trailing `exit 0` would never be reached -- hence `|| true` per branch
         # plus continue-on-error. If curl/bash are genuinely missing,
         # action-checkout fails next with a message that names the real problem.
-        continue-on-error: true
-        run: |
-          command -v curl >/dev/null 2>&1 && command -v bash >/dev/null 2>&1 && exit 0
-          SUDO=
-          if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then SUDO=sudo; fi
-          if command -v apt-get >/dev/null 2>&1; then
-            { $SUDO apt-get update -qq && DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq curl ca-certificates bash; } || true
-          elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache curl ca-certificates bash || true
-          elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y curl ca-certificates bash || true
-          elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y curl ca-certificates bash || true
-          elif command -v zypper >/dev/null 2>&1; then $SUDO zypper -n install curl ca-certificates bash || true
-          fi
-          exit 0
+      continue-on-error: true
+      run: |
+        command -v curl >/dev/null 2>&1 && command -v bash >/dev/null 2>&1 && exit 0
+        SUDO=
+        if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then SUDO=sudo; fi
+        if command -v apt-get >/dev/null 2>&1; then
+          { $SUDO apt-get update -qq && DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq curl ca-certificates bash; } || true
+        elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache curl ca-certificates bash || true
+        elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y curl ca-certificates bash || true
+        elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y curl ca-certificates bash || true
+        elif command -v zypper >/dev/null 2>&1; then $SUDO zypper -n install curl ca-certificates bash || true
+        fi
+        exit 0
 
-      - name: Check out arduino-esp32 as a component
-        uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-          submodules: recursive
-          path: components/arduino-esp32
+    - name: Check out arduino-esp32 as a component
+      uses: crashappsec/action-checkout@e9ff46a65f6403d9d88b87d248c3dfa41550ec75
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+        submodules: recursive
+        path: components/arduino-esp32
 
       # Need to install jq in the container to be able to use it in the script
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Setup jq
+      uses: dcarbone/install-jq-action@e397bd87438d72198f81efd21f876461183d383a   # v3.0.1
 
-      - name: Setup jq
-        uses: dcarbone/install-jq-action@e397bd87438d72198f81efd21f876461183d383a # v3.0.1
+    - name: Setup yq
+      run: |
+        YQ_VERSION="v4.48.1"
+        YQ_BINARY=yq_linux_amd64
+        wget -q https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY} -O /usr/bin/yq
+        chmod +x /usr/bin/yq
+        yq --version
 
-      - name: Setup yq
-        run: |
-          YQ_VERSION="v4.48.1"
-          YQ_BINARY=yq_linux_amd64
-          wget -q https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY} -O /usr/bin/yq
-          chmod +x /usr/bin/yq
-          yq --version
+    - name: Download affected examples
+      uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e   # v4.2.1
+      with:
+        name: affected_examples
 
-      - name: Download affected examples
-        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4.2.1
-        with:
-          name: affected_examples
+    - name: Build
+      env:
+        IDF_TARGET: ${{ matrix.idf_target }}
+      shell: bash
+      run: |
+        chmod a+x ./components/arduino-esp32/.github/scripts/*
+        ./components/arduino-esp32/.github/scripts/on-push-idf.sh affected_examples.txt
 
-      - name: Build
-        env:
-          IDF_TARGET: ${{ matrix.idf_target }}
-        shell: bash
-        run: |
-          chmod a+x ./components/arduino-esp32/.github/scripts/*
-          ./components/arduino-esp32/.github/scripts/on-push-idf.sh affected_examples.txt
+    - name: Upload generated sdkconfig files for debugging
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+      if: always()
+      with:
+        name: sdkconfig-${{ matrix.idf_ver }}-${{ matrix.idf_target }}
+        path: ./components/arduino-esp32/idf_component_examples/**/sdkconfig
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
-      - name: Upload generated sdkconfig files for debugging
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always()
-        with:
-          name: sdkconfig-${{ matrix.idf_ver }}-${{ matrix.idf_target }}
-          path: ./components/arduino-esp32/idf_component_examples/**/sdkconfig
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
