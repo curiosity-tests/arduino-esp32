@@ -20,9 +20,6 @@ on:
         - "info"
         - "debug"
         - "verbose"
-  schedule:
-    # Every Sunday at 2:00 UTC run a build with verbose log level
-  - cron: "0 2 * * SUN"
   push:
     branches:
     - master
